@@ -5,14 +5,14 @@ class LowPassFilter
     public:
         LowPassFilter() { }
 
-        LowPassFilter(float b)
+        LowPassFilter(float a)
         {
-            beta = b;
+            alpha = a;
         }
 
-        void setBeta(float b)
+        void setalpha(float a)
         {
-            beta = b;
+            alpha = a;
         }
 
         void setInitialValue(float data)
@@ -22,7 +22,7 @@ class LowPassFilter
 
         float addNewData(float data)
         {
-            currentValue = currentValue - (beta * (currentValue - data));
+            currentValue = (alpha * currentValue) + ((1.0 - alpha) * data);
             return currentValue;
         }
 
@@ -33,5 +33,5 @@ class LowPassFilter
 
     private:
         float currentValue;
-        float beta = 0.5;
+        float alpha = 0.0;   //Start with no filtering
 };

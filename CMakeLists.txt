@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.12)
 
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
-project(inertial_localization C CXX ASM)
+project(dwm_localization C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -11,8 +11,6 @@ pico_sdk_init()
 add_executable(${PROJECT_NAME}
     main.cpp
     mcp2515.cpp
-    lsm6dso_reg.c
-    lsm6dso_pid_pico.c
     dwm_api.c
     dwm1001_uart_pico.c
 )
@@ -24,5 +22,5 @@ target_link_libraries(${PROJECT_NAME}
     hardware_spi
 )
 
-pico_enable_stdio_usb(${PROJECT_NAME} 0)
+pico_enable_stdio_usb(${PROJECT_NAME} 1)
 pico_enable_stdio_uart(${PROJECT_NAME} 1)

@@ -1,57 +1,99 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include "hardware/timer.h"
 #include "include/mcp2515.h"
-#include "include/lsm6dso_pid_pico.h"
 #include "include/filters.hpp"
 #include "include/dwm1001_uart_pico.h"
+
+#define VERSION_NUMBER "1.1 build 2"
+
+#define CAN_BAUD_RATE 500000    //500 kbaud
+#define CAN_NODE_ID 0x5
+#define CAN_LOC_X_ADDRESS (CAN_NODE_ID << 5) | 0x1
+#define CAN_LOC_Y_ADDRESS (CAN_NODE_ID << 5) | 0x2
+#define CAN_LOC_Z_ADDRESS (CAN_NODE_ID << 5) | 0x3
+#define CAN_LOC_T_ADDRESS (CAN_NODE_ID << 5) | 0x4
+
+#define US_TO_MS_INT(us) (us / 1000)
+#define CONVERT_POSITION(p) ((p / 100) * 100.0)    //Truncate to 10cm then bring back to mm (as a float)
 
 //CAN Interface
 #define CAN_SCK_PIN 2
 #define CAN_TX_PIN 3
 #define CAN_RX_PIN 4
 #define CAN_CS_PIN 5
-//IMU Interface
-#define IMU_SCK_PIN 10
-#define IMU_TX_PIN 11
-#define IMU_RX_PIN 12
-#define IMU_CS_PIN 13
 //UWB Interface
-#define UWB_UART_TX_PIN 8
-#define UWB_UART_RX_PIN 9
-//STDIO Interface
-#define STDIO_UART_TX_PIN 16
-#define STDIO_UART_RX_PIN 17
+#define UWB_TX_PIN 8
+#define UWB_RX_PIN 9
+//LEDs
+#define GREEN_LED_PIN 16
+#define RED_LED_PIN 17
 
 #define STDIO_UART_PERIPHERAL uart0
 #define UWB_UART_PERIPHERAL uart1
 #define CANBUS_SPI_PERIPHERAL spi0
-#define IMU_SPI_PERIPHERAL spi1
 
-LSM6DSO_PID_Pico lsm6dso;
 DWM1001_Device dwm1001;
-LowPassFilter filter(0.015);
+repeating_timer_t canTimer;
+#define POSITION_FILTER_ALPHA 0.9
+LowPassFilter xPosFilter(POSITION_FILTER_ALPHA);
+LowPassFilter yPosFilter(POSITION_FILTER_ALPHA);
+LowPassFilter zPosFilter(POSITION_FILTER_ALPHA);
 
-MCP2515 mcp2515(CANBUS_SPI_PERIPHERAL, CAN_CS_PIN, CAN_TX_PIN, CAN_RX_PIN, CAN_SCK_PIN, 500000);
+dwm_pos_t position;
+dwm_loc_data_t location;
+float fPosition[4];
+absolute_time_t lastLocationTime;
+
+MCP2515 mcp2515(CANBUS_SPI_PERIPHERAL, CAN_CS_PIN, CAN_TX_PIN, CAN_RX_PIN, CAN_SCK_PIN, CAN_BAUD_RATE);
+
+bool canTimerCallback(repeating_timer_t * timer)
+{
+    can_frame frame;
+    int32_t deltaTime = US_TO_MS_INT(absolute_time_diff_us(lastLocationTime, get_absolute_time()));
+
+    frame.can_id = CAN_LOC_X_ADDRESS;
+    frame.can_dlc = 4;
+    memcpy(frame.data, &fPosition[0], 4);
+    mcp2515.sendMessage(&frame);
+    frame.can_id = CAN_LOC_Y_ADDRESS;
+    frame.can_dlc = 4;
+    memcpy(frame.data, &fPosition[1], 4);
+    mcp2515.sendMessage(&frame);
+    frame.can_id = CAN_LOC_Z_ADDRESS;
+    frame.can_dlc = 4;
+    memcpy(frame.data, &fPosition[2], 4);
+    mcp2515.sendMessage(&frame);
+    frame.can_id = CAN_LOC_T_ADDRESS;
+    frame.can_dlc = 4;
+    memcpy(frame.data, &deltaTime, 4);
+    mcp2515.sendMessage(&frame);
+
+    return true;
+}
 
 void startupStdio()
 {
-    //Remove UART from the default pins and put it on the custom pins
-    gpio_set_function(0, GPIO_FUNC_NULL);
-    gpio_set_function(1, GPIO_FUNC_NULL);
-    gpio_set_function(STDIO_UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(STDIO_UART_RX_PIN, GPIO_FUNC_UART);
-
     stdio_init_all();
+
+    for(int i = 0; i < 10; i++)
+    {
+        printf(".");
+        sleep_ms(500);
+    }
+
+    printf("\r\n\r\n\r\nVersion: %s\r\n", VERSION_NUMBER);
 }
 
 void startupUWB()
 {
     printf("Setting up DWM1001...\n");
 
-    dwm1001_init(&dwm1001, UWB_UART_PERIPHERAL, UWB_UART_TX_PIN, UWB_UART_RX_PIN);
+    dwm1001_init(&dwm1001, UWB_UART_PERIPHERAL, UWB_TX_PIN, UWB_RX_PIN);
     if(!dwm1001_check_communication(&dwm1001))
     {
         printf("Failed to communicate with the DWM1001\n");
@@ -61,58 +103,76 @@ void startupUWB()
     printf("DWM1001 setup complete\n");
 }
 
-void startupIMU()
-{
-    printf("Setting up LSM6DSO...\n");
-
-    lsm6dso_init(&lsm6dso, IMU_SPI_PERIPHERAL, IMU_CS_PIN);
-    lsm6dso_setupPort(&lsm6dso, 10000000, IMU_SCK_PIN, IMU_TX_PIN, IMU_RX_PIN);
-    if(!lsm6dso_check_communication(&lsm6dso))
-    {
-        printf("Failed to communicate with LSM6DSO\n");
-        while(1) sleep_ms(1);
-    }
-    lsm6dso_setupDevice(&lsm6dso, LSM6DSO_XL_ODR_104Hz, LSM6DSO_8g, LSM6DSO_GY_ODR_104Hz, LSM6DSO_500dps);
-
-    printf("LSM6DSO setup complete\n");
-}
-
 void startupCANBus()
 {
     printf("Setting up MCP2515...\n");
 
     mcp2515.reset();
-    mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+    mcp2515.setBitrate(CAN_500KBPS, MCP_16MHZ);
     mcp2515.setNormalMode();
 
     printf("MCP2515 setup complete\n");
 }
 
+void startupAlarms()
+{
+    alarm_pool_init_default();
+    add_repeating_timer_ms(100, canTimerCallback, NULL, &canTimer);
+}
+
+void setupGPIO()
+{
+    gpio_init(GREEN_LED_PIN);
+    gpio_init(RED_LED_PIN);
+    gpio_set_dir(GREEN_LED_PIN, GPIO_OUT);
+    gpio_set_dir(RED_LED_PIN, GPIO_OUT);
+}
+
 void peripheralStartup()
 {
+    setupGPIO();
+    gpio_put(RED_LED_PIN, true);
+
     startupStdio();
 
     printf("Setting up Pins and Peripherals...\n");
 
-    startupIMU();
-    startupUWB();
     startupCANBus();
+    startupUWB();
 
     printf("Pins and Peripherals setup complete\n");
+
+    gpio_put(RED_LED_PIN, false);
+    gpio_put(GREEN_LED_PIN, true);
 }
 
 int main ()
 {
-    dwm_pos_t position;
-    dwm_loc_data_t location;
-    location.p_pos = &position;
     peripheralStartup();
+
+    location.p_pos = &position;
+
+    while(!dwm1001_get_location(&dwm1001, &location));
+    xPosFilter.setInitialValue(CONVERT_POSITION(position.x));
+    yPosFilter.setInitialValue(CONVERT_POSITION(position.y));
+    zPosFilter.setInitialValue(CONVERT_POSITION(position.z));
+    
+    startupAlarms();
 
     while(true)
     {
         if(dwm1001_get_location(&dwm1001, &location))
         {
-            printf("Location: X: %.2f, Y: %.2f, Z: %.2f, Qf: %d%%\r\n", position.x / 1000.0, position.y / 1000.0, position.z / 1000.0, position.qf);
+            lastLocationTime = get_absolute_time();
+
+            fPosition[0] = xPosFilter.addNewData(CONVERT_POSITION(position.x));
+            fPosition[1] = yPosFilter.addNewData(CONVERT_POSITION(position.y));
+            fPosition[2] = zPosFilter.addNewData(CONVERT_POSITION(position.z));
+            printf("Filtered: %.2f, %.2f, %.2f, Raw: %.2f, %.2f, %.2f, Quality: %d%%, Time: %d\r\n",
+                    fPosition[0], fPosition[1], fPosition[2],
+                    CONVERT_POSITION(position.x), CONVERT_POSITION(position.y), CONVERT_POSITION(position.z),
+                    position.qf, to_ms_since_boot(lastLocationTime));
+
         }
     }
 }
