@@ -4,22 +4,29 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include "hardware/pll.h"
+#include "hardware/pwm.h"
 #include "hardware/timer.h"
 #include "include/mcp2515.h"
 #include "include/filters.hpp"
 #include "include/dwm1001_uart_pico.h"
 
-#define VERSION_NUMBER "1.1 build 2"
+#define VER_MAJOR       1
+#define VER_MINOR       2
+#define VER_REVISION    0
+#define VER_BUILD       1
 
 #define CAN_BAUD_RATE 500000    //500 kbaud
 #define CAN_NODE_ID 0x5
-#define CAN_LOC_X_ADDRESS (CAN_NODE_ID << 5) | 0x1
-#define CAN_LOC_Y_ADDRESS (CAN_NODE_ID << 5) | 0x2
-#define CAN_LOC_Z_ADDRESS (CAN_NODE_ID << 5) | 0x3
-#define CAN_LOC_T_ADDRESS (CAN_NODE_ID << 5) | 0x4
+//NOTE: There is a max of 32 messages per Node ID
+#define CAN_VER_ADDRESS         (CAN_NODE_ID << 5) | 0x0
+#define CAN_LOC_X_ADDRESS       (CAN_NODE_ID << 5) | 0x10
+#define CAN_LOC_Y_ADDRESS       (CAN_NODE_ID << 5) | 0x11
+#define CAN_LOC_Z_ADDRESS       (CAN_NODE_ID << 5) | 0x12
+#define CAN_QUALITY_ADDRESS     (CAN_NODE_ID << 5) | 0x13
+#define CAN_DELTA_TIME_ADDRESS  (CAN_NODE_ID << 5) | 0x14
 
 #define US_TO_MS_INT(us) (us / 1000)
-#define CONVERT_POSITION(p) ((p / 100) * 100.0)    //Truncate to 10cm then bring back to mm (as a float)
 
 //CAN Interface
 #define CAN_SCK_PIN 2
@@ -27,54 +34,40 @@
 #define CAN_RX_PIN 4
 #define CAN_CS_PIN 5
 //UWB Interface
-#define UWB_TX_PIN 8
-#define UWB_RX_PIN 9
+#define UWB_TX_PIN  8
+#define UWB_RX_PIN  9
+#define UWB_INT_PIN 10
+#define UWB_RST_PIN 11
 //LEDs
 #define GREEN_LED_PIN 16
 #define RED_LED_PIN 17
+#define LED_PWM_SLICE 0 //(PinNum >> 1) & 7 ... Can also use: uint pwm_gpio_to_slice_num(pinNum)
+#define LED_PWM_COUNTER_MIN 0
+#define LED_PWM_RED_ON_LVL  80
+#define LED_PWM_GRN_ON_LVL  40
+#define LED_PWM_COUNTER_MAX 100
+#define GREEN_LED_PWM_CHAN PWM_CHAN_A
+#define RED_LED_PWM_CHAN   PWM_CHAN_B
 
 #define STDIO_UART_PERIPHERAL uart0
 #define UWB_UART_PERIPHERAL uart1
 #define CANBUS_SPI_PERIPHERAL spi0
 
+#define UWB_UPDATE_RATE_DECISECOND 1
+
 DWM1001_Device dwm1001;
-repeating_timer_t canTimer;
-#define POSITION_FILTER_ALPHA 0.9
-LowPassFilter xPosFilter(POSITION_FILTER_ALPHA);
-LowPassFilter yPosFilter(POSITION_FILTER_ALPHA);
-LowPassFilter zPosFilter(POSITION_FILTER_ALPHA);
 
 dwm_pos_t position;
 dwm_loc_data_t location;
-float fPosition[4];
+float outputPosition[3];
+int32_t lastPosition[3];
 absolute_time_t lastLocationTime;
+absolute_time_t currentLocationTime;
+int32_t timeDifference;
+can_frame frame;
+uint8_t frameID = 0;
 
 MCP2515 mcp2515(CANBUS_SPI_PERIPHERAL, CAN_CS_PIN, CAN_TX_PIN, CAN_RX_PIN, CAN_SCK_PIN, CAN_BAUD_RATE);
-
-bool canTimerCallback(repeating_timer_t * timer)
-{
-    can_frame frame;
-    int32_t deltaTime = US_TO_MS_INT(absolute_time_diff_us(lastLocationTime, get_absolute_time()));
-
-    frame.can_id = CAN_LOC_X_ADDRESS;
-    frame.can_dlc = 4;
-    memcpy(frame.data, &fPosition[0], 4);
-    mcp2515.sendMessage(&frame);
-    frame.can_id = CAN_LOC_Y_ADDRESS;
-    frame.can_dlc = 4;
-    memcpy(frame.data, &fPosition[1], 4);
-    mcp2515.sendMessage(&frame);
-    frame.can_id = CAN_LOC_Z_ADDRESS;
-    frame.can_dlc = 4;
-    memcpy(frame.data, &fPosition[2], 4);
-    mcp2515.sendMessage(&frame);
-    frame.can_id = CAN_LOC_T_ADDRESS;
-    frame.can_dlc = 4;
-    memcpy(frame.data, &deltaTime, 4);
-    mcp2515.sendMessage(&frame);
-
-    return true;
-}
 
 void startupStdio()
 {
@@ -84,14 +77,23 @@ void startupStdio()
     {
         printf(".");
         sleep_ms(500);
+        
     }
 
-    printf("\r\n\r\n\r\nVersion: %s\r\n", VERSION_NUMBER);
+    printf("\r\n\r\n\r\nVersion: %d.%d.%d build %d\r\n", VER_MAJOR, VER_MINOR, VER_REVISION, VER_BUILD);
 }
 
 void startupUWB()
 {
     printf("Setting up DWM1001...\n");
+
+    gpio_set_dir(UWB_RST_PIN, GPIO_OUT);
+    gpio_put(UWB_INT_PIN, 1);
+    sleep_ms(10);
+    gpio_put(UWB_INT_PIN, 0);
+    sleep_ms(50);
+    gpio_put(UWB_INT_PIN, 1);
+    sleep_ms(100);
 
     dwm1001_init(&dwm1001, UWB_UART_PERIPHERAL, UWB_TX_PIN, UWB_RX_PIN);
     if(!dwm1001_check_communication(&dwm1001))
@@ -99,6 +101,8 @@ void startupUWB()
         printf("Failed to communicate with the DWM1001\n");
         while(1) sleep_ms(1);
     }
+
+    dwm1001_set_updateRate_deciSecond(&dwm1001, UWB_UPDATE_RATE_DECISECOND, UWB_UPDATE_RATE_DECISECOND);
 
     printf("DWM1001 setup complete\n");
 }
@@ -111,27 +115,45 @@ void startupCANBus()
     mcp2515.setBitrate(CAN_500KBPS, MCP_16MHZ);
     mcp2515.setNormalMode();
 
+    can_frame frame;
+
+    frame.can_id = CAN_VER_ADDRESS;
+    frame.can_dlc = 4;
+    frame.data[3] = VER_MAJOR;
+    frame.data[2] = VER_MINOR;
+    frame.data[1] = VER_REVISION;
+    frame.data[0] = VER_BUILD;
+    MCP2515::ERROR err = mcp2515.sendMessage(&frame);
+    if(err != MCP2515::ERROR_OK) printf("MCP Error: %d\r\n", err);
+
     printf("MCP2515 setup complete\n");
 }
 
-void startupAlarms()
+void setRedLED(bool on)
 {
-    alarm_pool_init_default();
-    add_repeating_timer_ms(100, canTimerCallback, NULL, &canTimer);
+    pwm_set_chan_level(LED_PWM_SLICE, RED_LED_PWM_CHAN, on ? LED_PWM_RED_ON_LVL : LED_PWM_COUNTER_MIN);
+}
+
+void setGreenLED(bool on)
+{
+    pwm_set_chan_level(LED_PWM_SLICE, GREEN_LED_PWM_CHAN, on ? LED_PWM_GRN_ON_LVL : LED_PWM_COUNTER_MIN);
 }
 
 void setupGPIO()
 {
-    gpio_init(GREEN_LED_PIN);
-    gpio_init(RED_LED_PIN);
-    gpio_set_dir(GREEN_LED_PIN, GPIO_OUT);
-    gpio_set_dir(RED_LED_PIN, GPIO_OUT);
+    gpio_set_function(GREEN_LED_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(RED_LED_PIN, GPIO_FUNC_PWM);
+    pwm_set_wrap(LED_PWM_SLICE, LED_PWM_COUNTER_MAX);
+    setRedLED(false);
+    setGreenLED(false);
+    pwm_set_enabled(LED_PWM_SLICE, true);
+
 }
 
 void peripheralStartup()
 {
     setupGPIO();
-    gpio_put(RED_LED_PIN, true);
+    setRedLED(true);
 
     startupStdio();
 
@@ -142,8 +164,16 @@ void peripheralStartup()
 
     printf("Pins and Peripherals setup complete\n");
 
-    gpio_put(RED_LED_PIN, false);
-    gpio_put(GREEN_LED_PIN, true);
+    setRedLED(false);
+    setGreenLED(true);
+}
+
+void convertPosition(float * outputPosition, int32_t inputPosition)
+{
+    //If we are initialized, just move the position over
+    if(*outputPosition == 0 || (inputPosition % 100 > 20 && inputPosition % 100 < 80))
+        *outputPosition = (inputPosition / 100) / 10.0;
+
 }
 
 int main ()
@@ -152,27 +182,49 @@ int main ()
 
     location.p_pos = &position;
 
-    while(!dwm1001_get_location(&dwm1001, &location));
-    xPosFilter.setInitialValue(CONVERT_POSITION(position.x));
-    yPosFilter.setInitialValue(CONVERT_POSITION(position.y));
-    zPosFilter.setInitialValue(CONVERT_POSITION(position.z));
-    
-    startupAlarms();
-
     while(true)
     {
         if(dwm1001_get_location(&dwm1001, &location))
         {
-            lastLocationTime = get_absolute_time();
+            currentLocationTime = get_absolute_time();
+            convertPosition(&outputPosition[0], position.x);
+            convertPosition(&outputPosition[1], position.y);
+            convertPosition(&outputPosition[2], position.z);
+            timeDifference = US_TO_MS_INT(absolute_time_diff_us(lastLocationTime, currentLocationTime));
 
-            fPosition[0] = xPosFilter.addNewData(CONVERT_POSITION(position.x));
-            fPosition[1] = yPosFilter.addNewData(CONVERT_POSITION(position.y));
-            fPosition[2] = zPosFilter.addNewData(CONVERT_POSITION(position.z));
-            printf("Filtered: %.2f, %.2f, %.2f, Raw: %.2f, %.2f, %.2f, Quality: %d%%, Time: %d\r\n",
-                    fPosition[0], fPosition[1], fPosition[2],
-                    CONVERT_POSITION(position.x), CONVERT_POSITION(position.y), CONVERT_POSITION(position.z),
-                    position.qf, to_ms_since_boot(lastLocationTime));
+            printf("ID: %3d, Quality: %3d%%, Delta Time: %10d, Position: Raw: %+10d, %+10d, %+10d, \"Filtered\": %+8.2f, %+8.2f, %+8.2f\r\n",
+                    frameID, position.qf, timeDifference,
+                    position.x, position.y, position.z,
+                    outputPosition[0], outputPosition[1], outputPosition[2]);
 
+            //Set up the CAN frame
+            frame.can_dlc = 5;  //Most things are 32 bit (float or integer)
+            //Add the frame ID so the other side can match all of the messages together
+            frame.data[0] = frameID;
+
+            frame.can_id = CAN_LOC_X_ADDRESS;
+            memcpy(frame.data + 1, &outputPosition[0], sizeof(float));
+            mcp2515.sendMessage(&frame);
+
+            frame.can_id = CAN_LOC_Y_ADDRESS;
+            memcpy(frame.data + 1, &outputPosition[1], sizeof(float));
+            mcp2515.sendMessage(&frame);
+
+            frame.can_id = CAN_LOC_Z_ADDRESS;
+            memcpy(frame.data + 1, &outputPosition[2], sizeof(float));
+            mcp2515.sendMessage(&frame);
+
+            frame.can_id = CAN_DELTA_TIME_ADDRESS;
+            memcpy(frame.data + 1, &timeDifference, sizeof(int32_t));
+            mcp2515.sendMessage(&frame);
+
+            frame.can_id = CAN_QUALITY_ADDRESS;
+            frame.can_dlc = 2;      //Uses an 8-bit integer, so 1 byte
+            memcpy(frame.data + 1, &position.qf, sizeof(uint8_t));
+            mcp2515.sendMessage(&frame);
+
+            lastLocationTime = currentLocationTime;
+            frameID++;
         }
     }
 }

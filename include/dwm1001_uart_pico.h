@@ -22,6 +22,7 @@ void dwm1001_init(DWM1001_Device * handle, uart_inst_t * uartPort, uint tx_pin, 
 bool dwm1001_check_communication(DWM1001_Device * handle);
 bool dwm1001_check_location_ready(DWM1001_Device * handle);
 bool dwm1001_get_location(DWM1001_Device * handle, dwm_loc_data_t* loc);
+void dwm1001_set_updateRate_deciSecond(DWM1001_Device * handle, uint16_t normal, uint16_t stationary);
 
 #ifdef __cplusplus
 }

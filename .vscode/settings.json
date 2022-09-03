@@ -23,5 +23,6 @@
     },
     "cmake.buildBeforeRun": true,
     "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
-    "cortex-debug.openocdPath": "C:/gnu_arm_embedded/pico/openocd-branch-rp2040-f8w14ec-windows/src/openocd.exe"
+    "cortex-debug.openocdPath": "C:/gnu_arm_embedded/pico/openocd-branch-rp2040-f8w14ec-windows/src/openocd.exe",
+    "cortex-debug.variableUseNaturalFormat": true
 }

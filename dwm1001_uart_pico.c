@@ -93,3 +93,13 @@ bool dwm1001_get_location(DWM1001_Device * handle, dwm_loc_data_t* loc)
 
     return 1;
 }
+
+void dwm1001_set_updateRate_deciSecond(DWM1001_Device * handle, uint16_t normal, uint16_t stationary)
+{
+    uint16_t curNorm, curStnry;
+
+    dwm_upd_rate_get(&(handle->uwb_device), &curNorm, &curStnry);
+
+    if(curNorm != normal || curStnry != stationary)
+        dwm_upd_rate_set(&(handle->uwb_device), normal, stationary);
+}
